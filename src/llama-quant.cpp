@@ -3,6 +3,7 @@
 #include "llama-model-loader.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "ggml-quants.h"
 
 #include <algorithm>
 #include <cmath>
@@ -579,6 +580,11 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
     if (category == tensor_category::OUTPUT || (qs.has_tied_embeddings && category == tensor_category::TOKEN_EMBD)) {
         if (qs.params->output_tensor_type < GGML_TYPE_COUNT) {
             new_type = qs.params->output_tensor_type;
+        } else if (qs.params->qat) {
+            // QAT-trained models retain quality at the default type (Q4_0)
+            // for embeddings and output, so skip the Q6_K promotion.
+            // The QAT training already optimized the quantized forward pass
+            // through these tensors.
         } else {
             const int64_t nx = tensor->ne[0];
             const int64_t qk_k = ggml_blck_size(new_type);
@@ -862,7 +868,65 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
 
 // quantize rows [first_row, first_row + nrows), indexed globally across all expert matrices
 // note: chunks never cross an expert boundary since each expert has its own imatrix slice
-static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t first_row, int64_t nrows, int64_t nrows_per_expert, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
+static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t first_row, int64_t nrows, int64_t nrows_per_expert, int64_t n_per_row, const float * imatrix, const ggml_half * qat_scales, std::vector<std::thread> & workers, const int nthread) {
+    // QAT path: use pre-inferred scales, bypass ggml_quantize_chunk
+    if (qat_scales && new_type == GGML_TYPE_Q4_0) {
+        const int64_t n_blocks_per_row = n_per_row / QK4_0;
+        if (nthread < 2) {
+            size_t new_size = quantize_q4_0_qat(f32_data, new_data, nrows, n_per_row, qat_scales);
+            if (!ggml_validate_row_data(new_type, new_data, new_size)) {
+                throw std::runtime_error("quantized data validation failed");
+            }
+            return new_size;
+        }
+
+        std::mutex mutex;
+        int64_t counter = 0;
+        size_t new_size = 0;
+        bool valid = true;
+        auto compute = [&mutex, &counter, &new_size, &valid, new_type, f32_data, new_data, chunk_size,
+                nrows, n_per_row, qat_scales, n_blocks_per_row]() {
+            const int64_t nrows_per_chunk = chunk_size / n_per_row;
+            size_t local_size = 0;
+            while (true) {
+                std::unique_lock<std::mutex> lock(mutex);
+                int64_t row_idx = counter; counter += nrows_per_chunk;
+                if (row_idx >= nrows) {
+                    if (local_size > 0) {
+                        new_size += local_size;
+                    }
+                    break;
+                }
+                lock.unlock();
+                const int64_t this_nrow = std::min(nrows - row_idx, nrows_per_chunk);
+                const float * f32_row = (const float *)((const char *)f32_data + row_idx * n_per_row * sizeof(float));
+                void * new_row = (char *)new_data + row_idx * n_per_row / QK4_0 * sizeof(block_q4_0);
+                const ggml_half * scales_row = qat_scales + row_idx * n_blocks_per_row;
+                size_t this_size = quantize_q4_0_qat(f32_row, new_row, this_nrow, n_per_row, scales_row);
+                local_size += this_size;
+
+                const size_t row_size = ggml_row_size(new_type, n_per_row);
+                void * this_data = (char *)new_data + row_idx * row_size;
+                this_size = this_nrow * row_size;
+                if (!ggml_validate_row_data(new_type, this_data, this_size)) {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    valid = false;
+                    break;
+                }
+            }
+        };
+        for (int it = 0; it < nthread - 1; ++it) {
+            workers.emplace_back(compute);
+        }
+        compute();
+        for (auto & w : workers) { w.join(); }
+        workers.clear();
+        if (!valid) {
+            throw std::runtime_error("quantized data validation failed");
+        }
+        return new_size;
+    }
+
     const size_t row_size = ggml_row_size(new_type, n_per_row);
 
     auto imatrix_for_row = [=](int64_t row_global) {
@@ -1410,6 +1474,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
                 // process rows across all experts in one pass to keep all threads busy
                 new_size = 0;
+                std::vector<ggml_half> qat_scales_buf;
+                int64_t qat_scales_inferred_total = 0;
+
                 for (int64_t ir = 0; ir < nrows_total; ir += nrows_slab) {
                     const int64_t nrows_cur = std::min(nrows_slab, nrows_total - ir);
                     const int64_t nelements_cur = nrows_cur * n_per_row;
@@ -1427,6 +1494,17 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         f32_data = (const float *) f32_conv_buf.data();
                     }
 
+                    const ggml_half * qat_scales = nullptr;
+                    if (params->qat && new_type == GGML_TYPE_Q4_0) {
+                        const int64_t n_blocks_cur = nrows_cur * (n_per_row / QK4_0);
+                        if (qat_scales_buf.size() < (size_t) n_blocks_cur) {
+                            qat_scales_buf.resize(n_blocks_cur);
+                        }
+                        ggml_infer_q4_0_qat_scales(f32_data, qat_scales_buf.data(), nelements_cur);
+                        qat_scales = qat_scales_buf.data();
+                        qat_scales_inferred_total += n_blocks_cur;
+                    }
+
                     if (work.size() < nrows_cur*row_size_dst) {
                         work.resize(nrows_cur*row_size_dst);
                     }
@@ -1434,10 +1512,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     const int64_t nchunk = (nelements_cur + chunk_size - 1)/chunk_size;
                     const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
-                    const size_t size_cur = llama_tensor_quantize_impl(new_type, f32_data, work.data(), chunk_size, ir, nrows_cur, nrows_per_expert, n_per_row, imatrix, workers, nthread_use);
+                    const size_t size_cur = llama_tensor_quantize_impl(new_type, f32_data, work.data(), chunk_size, ir, nrows_cur, nrows_per_expert, n_per_row, imatrix, qat_scales, workers, nthread_use);
 
                     fout.write((const char *) work.data(), size_cur);
                     new_size += size_cur;
+                }
+                if (qat_scales_inferred_total > 0) {
+                    LLAMA_LOG_INFO("  [QAT] inferred %" PRId64 " scales from source weights\n", qat_scales_inferred_total);
                 }
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, new_size/1024.0/1024.0);
             }
@@ -1492,6 +1573,7 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.pure                        =*/ false,
         /*.keep_split                  =*/ false,
         /*.dry_run                     =*/ false,
+        /*.qat                         =*/ false,
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
